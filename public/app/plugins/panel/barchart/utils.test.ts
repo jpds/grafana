@@ -1,4 +1,5 @@
 import { assertIsDefined } from 'test/helpers/asserts';
+import type uPlot from 'uplot';
 
 import {
   createDataFrame,
@@ -22,13 +23,24 @@ import {
   VisibilityMode,
   VizOrientation,
 } from '@grafana/schema';
-import { type UPlotConfigBuilder } from '@grafana/ui';
+import { measureText, type UPlotConfigBuilder } from '@grafana/ui';
 
 import type { BarsOptions } from './bars';
 import * as barsModule from './bars';
 import type { Options } from './panelcfg.gen';
 import { applyBarChartFieldDefaults } from './test-helpers';
 import { prepConfig, type PrepConfigOpts, prepSeries } from './utils';
+
+const realMeasureText = jest.requireActual('@grafana/ui').measureText as typeof measureText;
+
+jest.mock('@grafana/ui', () => {
+  const actual = jest.requireActual('@grafana/ui');
+  return {
+    ...actual,
+    // passthrough by default; the auto-spacing describe pins widths per test
+    measureText: jest.fn(actual.measureText),
+  };
+});
 
 jest.mock('@grafana/data', () => ({
   ...jest.requireActual('@grafana/data'),
@@ -433,6 +445,178 @@ describe('BarChart utils', () => {
       expect(info.color?.name).toBe('colorVal');
     });
   });
+
+  describe('auto-spacing for time axis labels', () => {
+    // Daily timestamps starting 2021-01-01 UTC
+    const dayMs = 24 * 60 * 60 * 1000;
+    const start = 1609459200000;
+
+    type XAxisFilter = (u: uPlot, splits: number[]) => Array<number | null>;
+
+    /** uPlot instance shape consumed by the axis filter callback. */
+    interface FilterMockUPlot {
+      data: number[][];
+      bbox: { left: number; top: number; width: number; height: number };
+    }
+
+    /**
+     * Casts FilterMockUPlot to uPlot for filter invocation.
+     * Confines the type assertion to one place (mirrors asUPlot in bars.test.ts).
+     */
+    function asUPlot(u: FilterMockUPlot): uPlot {
+      // @ts-expect-error incomplete mock satisfies only the axis-filter contract
+      return u;
+    }
+
+    function mockUPlotFor(timestamps: number[], bboxWidth: number, bboxHeight: number): FilterMockUPlot {
+      return { data: [timestamps], bbox: { left: 0, top: 0, width: bboxWidth, height: bboxHeight } };
+    }
+
+    const measureTextMock = jest.mocked(measureText);
+
+    beforeEach(() => {
+      measureTextMock.mockImplementation(realMeasureText);
+    });
+
+    afterEach(() => {
+      measureTextMock.mockImplementation(realMeasureText);
+    });
+
+    /** Pins measured axis-label width so the auto-spacing math is deterministic. */
+    function mockTimeLabelWidth(width: number): void {
+      measureTextMock.mockReturnValue({ width } as unknown as ReturnType<typeof measureText>);
+    }
+
+    function extractXAxisFilter(
+      df: DataFrame,
+      opts: { xTickLabelSpacing?: number; orientation?: VizOrientation } = {}
+    ): XAxisFilter | undefined {
+      const info = prepBarChartSeries([df]);
+
+      return prepConfig(
+        createPrepConfigOpts({
+          series: info.series,
+          // Vertical bars draw the x-axis horizontally (label-width-driven spacing);
+          // Auto resolves differently, so be explicit
+          orientation: opts.orientation ?? VizOrientation.Vertical,
+          options: { xTickLabelSpacing: opts.xTickLabelSpacing ?? 0 },
+        })
+      ).builder.getConfig().axes![0].filter as XAxisFilter | undefined;
+    }
+
+    it('keeps every tick when the chart is wide enough for all labels', () => {
+      mockTimeLabelWidth(42);
+      const timestamps = [start, start + dayMs, start + 2 * dayMs];
+      const filter = extractXAxisFilter(createTimeXFrame({ timeValues: timestamps }))!;
+      const u = asUPlot(mockUPlotFor(timestamps, 2000, 400));
+
+      // 42px labels + 18px padding = 60px per tick; 2000px fits far more than 3 ticks
+      expect(filter(u, [0, 1, 2])).toEqual([0, 1, 2]);
+    });
+
+    it('keeps exactly one tick on a narrow chart', () => {
+      mockTimeLabelWidth(42);
+      const timestamps = Array.from({ length: 30 }, (_, i) => start + i * dayMs);
+      const filter = extractXAxisFilter(createTimeXFrame({ timeValues: timestamps }))!;
+      const u = asUPlot(mockUPlotFor(timestamps, 100, 400));
+
+      // 60px spacing leaves a single 100px slot → keep index 0, drop the rest
+      const result = filter(
+        u,
+        timestamps.map((_, i) => i)
+      );
+      expect(result.filter((v) => v !== null)).toEqual([0]);
+      // spacing derives from the label measured at UPLOT_AXIS_FONT_SIZE
+      expect(measureTextMock).toHaveBeenCalledWith(expect.any(String), 12);
+    });
+
+    it('spaces vertical-axis ticks by font height rather than measured label width', () => {
+      mockTimeLabelWidth(42);
+      const timestamps = Array.from({ length: 20 }, (_, i) => start + i * dayMs);
+      // Horizontal bars draw the x-axis vertically; bbox.height governs spacing
+      const filter = extractXAxisFilter(createTimeXFrame({ timeValues: timestamps }), {
+        orientation: VizOrientation.Horizontal,
+      })!;
+      const u = asUPlot(mockUPlotFor(timestamps, 400, 200));
+
+      // 12px font + 8px padding = 20px per tick → 10 slots in 200px → keep every 2nd tick.
+      // Width-based spacing (60px) would keep only 3, so this fails if the vertical
+      // path reuses the horizontal logic.
+      expect(
+        filter(
+          u,
+          timestamps.map((_, i) => i)
+        ).filter((v) => v !== null)
+      ).toEqual([0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
+    });
+
+    it('honours user-configured xTickLabelSpacing without measuring labels', () => {
+      mockTimeLabelWidth(999); // huge width proves the measurement is ignored
+      const timestamps = Array.from({ length: 30 }, (_, i) => start + i * dayMs);
+      const filter = extractXAxisFilter(createTimeXFrame({ timeValues: timestamps }), {
+        xTickLabelSpacing: 50,
+      })!;
+      const u = asUPlot(mockUPlotFor(timestamps, 100, 400));
+
+      // 50px spacing → two 100px slots → forward alignment keeps indices 0 and 15
+      expect(
+        filter(
+          u,
+          timestamps.map((_, i) => i)
+        )
+      ).toEqual([
+        0,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        15,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+      ]);
+    });
+
+    it('does not auto-space when the time field pins an explicit unit format', () => {
+      const filter = extractXAxisFilter(createTimeXFrame({ xUnit: 'time:YYYY-MM-DD' }));
+      expect(filter).toBeUndefined();
+    });
+
+    it('does not auto-space categorical string axes', () => {
+      const filter = extractXAxisFilter(createStringXFrame());
+      expect(filter).toBeUndefined();
+    });
+
+    it('keeps the only tick when there is a single data point', () => {
+      mockTimeLabelWidth(42);
+      const timestamps = [start];
+      const filter = extractXAxisFilter(createTimeXFrame({ timeValues: timestamps }))!;
+      const u = asUPlot(mockUPlotFor(timestamps, 400, 400));
+
+      expect(filter(u, [0])).toEqual([0]);
+    });
+  });
 });
 
 // =============================================================================
@@ -459,6 +643,7 @@ interface CreateTimeXFrameOverrides {
   timeValues?: number[];
   values?: number[];
   refId?: string;
+  xUnit?: string;
 }
 
 /** Overrides for createFrameWithColorField. */
@@ -583,7 +768,7 @@ function createTimeXFrame(overrides?: CreateTimeXFrameOverrides): DataFrame {
       name: 'time',
       type: FieldType.time,
       values: timeValues,
-      config: { custom: {} },
+      config: overrides?.xUnit ? { unit: overrides.xUnit, custom: {} } : { custom: {} },
     },
     valueField: { values, config: { unit: 'short', custom: {} } },
   });
